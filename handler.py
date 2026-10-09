@@ -1,15 +1,18 @@
 import os
 import io
+import gc
 import base64
+import traceback
+
 import torch
 import runpod
-
 from PIL import Image
+
 from diffusers import QwenImage21Pipeline
 
 
 # ============================================================
-# MODEL PATH
+# CONFIG
 # ============================================================
 
 MODEL_PATH = os.environ.get(
@@ -17,71 +20,243 @@ MODEL_PATH = os.environ.get(
     "/runpod-volume/comfyui/models/diffusers/Qwen-Image-2.1-Turbo"
 )
 
-
-# ============================================================
-# LOAD MODEL ONCE PER WORKER
-# ============================================================
-
-print("=" * 70)
-print("Loading Qwen Image 2.1 Turbo")
-print("Model path:", MODEL_PATH)
-print("CUDA available:", torch.cuda.is_available())
-
-if torch.cuda.is_available():
-    props = torch.cuda.get_device_properties(0)
-    print("GPU:", props.name)
-    print("VRAM GB:", round(props.total_memory / 1024**3, 2))
-
-print("=" * 70)
-
-
-pipe = QwenImage21Pipeline.from_pretrained(
-    MODEL_PATH,
-    torch_dtype=torch.bfloat16,
-    local_files_only=True,
-    low_cpu_mem_usage=True,
+DEFAULT_WIDTH = int(os.environ.get("DEFAULT_WIDTH", "1024"))
+DEFAULT_HEIGHT = int(os.environ.get("DEFAULT_HEIGHT", "1024"))
+DEFAULT_OUTPUT_RESOLUTION = int(
+    os.environ.get("DEFAULT_OUTPUT_RESOLUTION", "1024")
 )
 
 
-# Qwen Image 2.1 Turbo BF16 is too large to keep every component
-# resident simultaneously on a typical RTX 4090 24GB.
-#
-# Model CPU offload keeps the active module on GPU while moving
-# inactive components back to system RAM.
-pipe.enable_model_cpu_offload()
+# ============================================================
+# LOGGING
+# ============================================================
 
-# Helps larger image decoding without requiring huge VAE memory.
-pipe.vae.enable_tiling()
-
-print("Qwen Image 2.1 Turbo loaded successfully.")
+def log(message):
+    print(message, flush=True)
 
 
 # ============================================================
-# IMAGE HELPERS
+# CHECK MODEL
+# ============================================================
+
+log("=" * 80)
+log("Qwen Image 2.1 Turbo Serverless Worker")
+log("=" * 80)
+
+log(f"MODEL_PATH: {MODEL_PATH}")
+log(f"MODEL_PATH exists: {os.path.exists(MODEL_PATH)}")
+log(f"MODEL_PATH is directory: {os.path.isdir(MODEL_PATH)}")
+
+if not os.path.isdir(MODEL_PATH):
+    log("ERROR: Turbo model directory does not exist.")
+
+    if os.path.exists("/runpod-volume"):
+        log(
+            "/runpod-volume contents: "
+            + str(os.listdir("/runpod-volume")[:50])
+        )
+
+    if os.path.exists("/runpod-volume/comfyui"):
+        log(
+            "/runpod-volume/comfyui contents: "
+            + str(os.listdir("/runpod-volume/comfyui")[:50])
+        )
+
+    if os.path.exists("/runpod-volume/comfyui/models"):
+        log(
+            "/runpod-volume/comfyui/models contents: "
+            + str(os.listdir("/runpod-volume/comfyui/models")[:50])
+        )
+
+    if os.path.exists("/runpod-volume/comfyui/models/diffusers"):
+        log(
+            "/runpod-volume/comfyui/models/diffusers contents: "
+            + str(
+                os.listdir(
+                    "/runpod-volume/comfyui/models/diffusers"
+                )[:50]
+            )
+        )
+
+    raise RuntimeError(
+        f"Model directory not found: {MODEL_PATH}"
+    )
+
+log("Turbo model files:")
+for filename in os.listdir(MODEL_PATH)[:50]:
+    log(f"  - {filename}")
+
+
+# ============================================================
+# CUDA INFO
+# ============================================================
+
+log("=" * 80)
+log(f"CUDA available: {torch.cuda.is_available()}")
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA GPU is required.")
+
+gpu = torch.cuda.get_device_properties(0)
+
+TOTAL_VRAM_GB = gpu.total_memory / (1024 ** 3)
+
+log(f"GPU: {gpu.name}")
+log(f"VRAM: {TOTAL_VRAM_GB:.2f} GB")
+log(f"PyTorch: {torch.__version__}")
+log(f"CUDA: {torch.version.cuda}")
+log("=" * 80)
+
+
+# ============================================================
+# LOAD TURBO PIPELINE
+# ============================================================
+
+log("Loading Qwen Image 2.1 Turbo...")
+
+pipe = QwenImage21Pipeline.from_pretrained(
+    MODEL_PATH,
+    dtype=torch.bfloat16,
+    local_files_only=True,
+    low_cpu_mem_usage=True
+)
+
+
+# ============================================================
+# MEMORY MANAGEMENT
+# ============================================================
+
+# Your current GPU exposes ~24 GB.
+#
+# Keeping the entire BF16 Turbo pipeline resident is unsafe at
+# this VRAM level, so use Accelerate model CPU offload.
+#
+# Active modules are transferred onto the GPU automatically.
+
+log("Enabling model CPU offload...")
+
+pipe.enable_model_cpu_offload()
+
+# Reduce VAE memory spikes.
+try:
+    pipe.vae.enable_tiling()
+    log("VAE tiling enabled.")
+except Exception as e:
+    log(f"VAE tiling unavailable: {e}")
+
+try:
+    pipe.vae.enable_slicing()
+    log("VAE slicing enabled.")
+except Exception as e:
+    log(f"VAE slicing unavailable: {e}")
+
+
+log("=" * 80)
+log("Qwen Image 2.1 Turbo loaded successfully.")
+log("Official Turbo 8-step schedule will be used automatically.")
+log("=" * 80)
+
+
+# ============================================================
+# IMAGE FUNCTIONS
 # ============================================================
 
 def decode_base64_image(value):
     """
-    Accepts:
-      data:image/png;base64,...
-      data:image/jpeg;base64,...
-      raw base64
+    Supports:
+
+    data:image/png;base64,...
+    data:image/jpeg;base64,...
+    raw base64
     """
 
     if not isinstance(value, str):
         raise ValueError("Image must be a base64 string.")
 
-    if "," in value and value.startswith("data:"):
+    if value.startswith("data:"):
+        if "," not in value:
+            raise ValueError("Invalid data URL.")
+
         value = value.split(",", 1)[1]
 
-    image_bytes = base64.b64decode(value)
+    try:
+        raw = base64.b64decode(value)
+    except Exception as e:
+        raise ValueError(
+            f"Invalid base64 image: {e}"
+        )
 
-    return Image.open(
-        io.BytesIO(image_bytes)
-    ).convert("RGBA")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception as e:
+        raise ValueError(
+            f"Unable to decode image: {e}"
+        )
+
+    # Qwen pipeline handles conversion internally,
+    # but normalize here for predictable API behaviour.
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+
+    return image
 
 
-def encode_image(image):
+def normalize_images(items):
+    """
+    Accepts:
+
+    "images": [
+        "data:image/png;base64,..."
+    ]
+
+    OR
+
+    "images": [
+        {
+            "name": "reference.png",
+            "image": "data:image/png;base64,..."
+        }
+    ]
+    """
+
+    if not items:
+        return None
+
+    if not isinstance(items, list):
+        raise ValueError(
+            "'images' must be an array."
+        )
+
+    images = []
+
+    for index, item in enumerate(items):
+
+        if isinstance(item, str):
+            value = item
+
+        elif isinstance(item, dict):
+            value = item.get("image")
+
+            if not value:
+                raise ValueError(
+                    f"images[{index}] does not contain an 'image' field."
+                )
+
+        else:
+            raise ValueError(
+                f"images[{index}] must be a base64 string "
+                "or an object containing an 'image' field."
+            )
+
+        images.append(
+            decode_base64_image(value)
+        )
+
+    return images
+
+
+def encode_png(image):
     buffer = io.BytesIO()
 
     image.save(
@@ -97,94 +272,58 @@ def encode_image(image):
     return "data:image/png;base64," + encoded
 
 
-def normalize_input_images(items):
-    """
-    Supports:
-
-    "images": [
-        "data:image/png;base64,..."
-    ]
-
-    OR your old RunPod style:
-
-    "images": [
-        {
-            "name": "input.png",
-            "image": "data:image/png;base64,..."
-        }
-    ]
-    """
-
-    if not items:
-        return None
-
-    output = []
-
-    for item in items:
-
-        if isinstance(item, dict):
-            value = item.get("image")
-
-            if not value:
-                raise ValueError(
-                    "Image object must contain an 'image' field."
-                )
-
-        elif isinstance(item, str):
-            value = item
-
-        else:
-            raise ValueError(
-                "Each image must be a base64 string or an object containing 'image'."
-            )
-
-        output.append(
-            decode_base64_image(value)
-        )
-
-    return output
-
-
 # ============================================================
-# RUNPOD HANDLER
+# GENERATION
 # ============================================================
 
-def handler(job):
-
-    inp = job.get("input", {})
+def generate(inp):
 
     prompt = inp.get("prompt")
 
+    if not prompt or not isinstance(prompt, str):
+        raise ValueError(
+            "'prompt' is required and must be a string."
+        )
+
+    prompt = prompt.strip()
+
     if not prompt:
-        return {
-            "error": "Missing required input: prompt"
-        }
+        raise ValueError(
+            "'prompt' cannot be empty."
+        )
 
     seed = int(
-        inp.get("seed", 0)
-    )
-
-    images = normalize_input_images(
-        inp.get("images")
+        inp.get("seed", 42)
     )
 
     use_kv_cache = bool(
         inp.get("use_kv_cache", True)
     )
 
+    images = normalize_images(
+        inp.get("images")
+    )
+
+    mode = (
+        "image_edit"
+        if images
+        else "text_to_image"
+    )
+
+
+    # --------------------------------------------------------
+    # Generator
+    # --------------------------------------------------------
+
+    # CPU generator works reliably with model CPU offload.
     generator = torch.Generator(
         device="cpu"
     ).manual_seed(seed)
 
-    # ========================================================
-    # BASE PIPELINE PARAMETERS
-    #
-    # IMPORTANT:
-    # DO NOT manually specify num_inference_steps.
-    #
-    # Qwen Image 2.1 Turbo contains its official 8-step
-    # sampling schedule in the checkpoint.
-    # ========================================================
+
+    # --------------------------------------------------------
+    # Base Qwen arguments
+    # --------------------------------------------------------
 
     kwargs = {
         "prompt": prompt,
@@ -194,7 +333,7 @@ def handler(job):
 
 
     # ========================================================
-    # IMAGE EDITING / MULTI-REFERENCE
+    # IMAGE EDITING / MULTI REFERENCE
     # ========================================================
 
     if images:
@@ -202,24 +341,28 @@ def handler(job):
         kwargs["image"] = images
 
         output_resolution = int(
-            inp.get("output_resolution", 1024)
+            inp.get(
+                "output_resolution",
+                DEFAULT_OUTPUT_RESOLUTION
+            )
         )
 
         kwargs["output_resolution"] = output_resolution
 
-        # Optional explicit output size.
+        # Width / height are optional for image editing.
         #
-        # If omitted, Qwen automatically follows the
-        # reference-image aspect ratio.
+        # If omitted, Qwen derives output dimensions from
+        # the condition-image aspect ratio.
 
-        width = inp.get("width")
-        height = inp.get("height")
+        if inp.get("width") is not None:
+            kwargs["width"] = int(
+                inp["width"]
+            )
 
-        if width is not None:
-            kwargs["width"] = int(width)
-
-        if height is not None:
-            kwargs["height"] = int(height)
+        if inp.get("height") is not None:
+            kwargs["height"] = int(
+                inp["height"]
+            )
 
 
     # ========================================================
@@ -228,21 +371,59 @@ def handler(job):
 
     else:
 
-        width = int(
-            inp.get("width", 1024)
+        kwargs["width"] = int(
+            inp.get(
+                "width",
+                DEFAULT_WIDTH
+            )
         )
 
-        height = int(
-            inp.get("height", 1024)
+        kwargs["height"] = int(
+            inp.get(
+                "height",
+                DEFAULT_HEIGHT
+            )
         )
-
-        kwargs["width"] = width
-        kwargs["height"] = height
 
 
     # ========================================================
-    # GENERATE
+    # IMPORTANT:
+    #
+    # DO NOT add:
+    #
+    # num_inference_steps=8
+    # sigmas=[...]
+    #
+    # Qwen-Image-2.1-Turbo already has its official sampling
+    # sigmas saved in the checkpoint.
+    #
+    # Diffusers automatically uses them.
     # ========================================================
+
+    log("-" * 80)
+    log(f"Mode: {mode}")
+    log(f"Seed: {seed}")
+    log(f"KV cache: {use_kv_cache}")
+    log(f"Prompt: {prompt[:500]}")
+
+    if images:
+        log(f"Reference images: {len(images)}")
+        log(
+            f"Output resolution: "
+            f"{kwargs.get('output_resolution')}"
+        )
+    else:
+        log(
+            f"Output size: "
+            f"{kwargs['width']}x{kwargs['height']}"
+        )
+
+    log("Starting Turbo generation...")
+
+
+    # --------------------------------------------------------
+    # Generate
+    # --------------------------------------------------------
 
     with torch.inference_mode():
 
@@ -250,16 +431,65 @@ def handler(job):
             **kwargs
         )
 
-    output_image = result.images[0]
+
+    image = result.images[0]
+
+    log(
+        f"Generation finished. "
+        f"Output size: {image.width}x{image.height}"
+    )
 
     return {
-        "image": encode_image(output_image),
+        "image": encode_png(image),
         "seed": seed,
-        "mode": "image_edit" if images else "text_to_image",
+        "mode": mode,
+        "width": image.width,
+        "height": image.height,
         "turbo_steps": 8,
         "kv_cache": use_kv_cache,
     }
 
+
+# ============================================================
+# RUNPOD HANDLER
+# ============================================================
+
+def handler(job):
+
+    try:
+
+        inp = job.get("input", {})
+
+        result = generate(inp)
+
+        return result
+
+    except Exception as e:
+
+        log("=" * 80)
+        log("GENERATION ERROR")
+        log(str(e))
+        log(traceback.format_exc())
+        log("=" * 80)
+
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+    finally:
+
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ============================================================
+# SERVERLESS START
+# ============================================================
+
+log("Starting RunPod Serverless handler...")
 
 runpod.serverless.start(
     {
